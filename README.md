@@ -8,6 +8,9 @@ throughput of
 ```sh cat /dev/zero | pv > /dev/null
 ```
 
+It supports at most 16 digits, which theoretically takes about a day to reach.
+At that point, the script terminates with an error.
+
 ## Usage
 
 
