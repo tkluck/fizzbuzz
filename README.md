@@ -5,7 +5,8 @@ objective is to generate the highest throughput for FizzBuzz possible. On my
 personal laptop, this julia script reaches ~10GiB/s, or about triple the
 throughput of
 
-```sh cat /dev/zero | pv > /dev/null
+```sh
+cat /dev/zero | pv > /dev/null
 ```
 
 It supports at most 16 digits, which theoretically takes about a day to reach.
