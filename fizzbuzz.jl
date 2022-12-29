@@ -60,15 +60,19 @@ put(buffer::StaticBuffer, s::ShortString) = begin
 end
 
 """
-    getpipefd!(io::IO)
+    withpipefd(f, io::IO, args...; kwds...)
 
-Get a file descriptor (`::RawFD`) that is known to be a pipe; if `io`
-isn't a pipe already, we insert a dummy `cat` process. This allows us
-to use `vmsplice` which is much faster in the benchmark setup than `write`.
+Run `f` with a file descriptor (`::RawFD`) that is known to be a pipe; if `io`
+isn't a pipe already, we insert a dummy `cat` process. This allows us to use
+`vmsplice` which is much faster in the benchmark setup than `write`.
 """
-getpipefd!(io::Base.PipeEndpoint) = Base._fd(io)
-getpipefd!(io::Base.IOContext) = getpipefd!(io.io)
-getpipefd!(io) = getpipefd!(open(pipeline(`cat`, stdout=io), write=true).in)
+withpipefd(f, io::Base.PipeEndpoint, args...; kwds...) = f(Base._fd(io), args...; kwds...)
+withpipefd(f, io::Base.IOContext, args...; kwds...) = withpipefd(f, io.io, args...; kwds...)
+withpipefd(f, io, args...; kwds...) = begin
+  process = open(pipeline(`cat`, stdout=io), write=true)
+  withpipefd(f, process.in, args...; kwds...)
+  close(process)
+end
 
 """
     vmsplice(fdesc, buffer)
@@ -273,21 +277,10 @@ end
 
 const BUFSIZE = 100 * 4096
 
-"""
-  fizzbuzz(io::IO, cutoff=typemax(Int))
-
-Write the fizzbuzz output to `io`. This will spawn `Threads.nthreads()`
-tasks to maximize throughput through parallellism.
-
-The `cutoff` parameter is approximate; depending on buffering, more lines
-may be written to `io`.
-"""
-fizzbuzz(io::IO, cutoff=typemax(Int)) = begin
+fizzbuzz(fdesc::RawFD, cutoff=typemax(Int)) = begin
   LOGSTART[] = time_ns()
 
   buffers = [StaticBuffer(BUFSIZE) for _ in 1:Threads.nthreads()]
-
-  fdesc = getpipefd!(io)
 
   nextline = 1
   chunklen = div(BUFSIZE, sizeof(UInt128))
@@ -307,6 +300,17 @@ fizzbuzz(io::IO, cutoff=typemax(Int)) = begin
     end
   end
 end
+
+"""
+  fizzbuzz(io::IO, cutoff=typemax(Int))
+
+Write the fizzbuzz output to `io`. This will spawn `Threads.nthreads()`
+tasks to maximize throughput through parallellism.
+
+The `cutoff` parameter is approximate; depending on buffering, more lines
+may be written to `io`.
+"""
+fizzbuzz(io::IO, cutoff=typemax(Int)) = withpipefd(fizzbuzz, io, cutoff)
 
 if abspath(PROGRAM_FILE) == @__FILE__
   fizzbuzz(stdout)
