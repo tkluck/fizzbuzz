@@ -1,4 +1,6 @@
-const LOGSTART = Ref{UInt64}(0)
+const PAGESIZE = 4096
+const L2_CACHE_SIZE = 256 * PAGESIZE
+const BUFSIZE = L2_CACHE_SIZE ÷ 2
 
 """
     ShortString("foo")
@@ -37,26 +39,33 @@ end
 
 Represents a simple byte array together with its next index.
 
-This struct is non-mutable, and instead of updating `nextindex` in place, we
+This struct is non-mutable, and instead of updating `ptr` in place, we
 replace it with a new StaticBuffer (see the `put` implementation).
 This has experimentally been much faster; I think the compiler can apply
 more optimizations when it keeps the struct on the stack.
 """
 struct StaticBuffer
   buf :: Vector{UInt8}
-  nextindex :: Int
+  ptr :: Ptr{UInt128}
 end
 
-StaticBuffer(size) = StaticBuffer(Vector{UInt8}(undef, size), 1)
+StaticBuffer(size) = begin
+  buf = Vector{UInt8}(undef, size)
+  ptr = pointer(buf)
+  StaticBuffer(buf, ptr)
+end
 
-Base.length(buffer::StaticBuffer) = length(buffer.buf)
-Base.pointer(buffer::StaticBuffer) = pointer(buffer.buf, buffer.nextindex)
-Base.truncate(buffer::StaticBuffer) = StaticBuffer(buffer.buf, 1)
+Base.length(buffer::StaticBuffer) = buffer.ptr - pointer(buffer.buf)
+Base.pointer(buffer::StaticBuffer) = buffer.ptr
+Base.truncate(buffer::StaticBuffer) = StaticBuffer(buffer.buf, pointer(buffer.buf))
 
 put(buffer::StaticBuffer, s::ShortString) = begin
-  dest = Ptr{UInt128}(pointer(buffer))
-  unsafe_store!(dest, s.val)
-  StaticBuffer(buffer.buf, buffer.nextindex + s.len)
+  unsafe_store!(buffer.ptr, s.val)
+  StaticBuffer(buffer.buf, buffer.ptr + s.len)
+end
+
+almostfull(buffer::StaticBuffer) = begin
+  length(buffer.buf) - (buffer.ptr - pointer(buffer.buf)) < PAGESIZE
 end
 
 """
@@ -80,17 +89,17 @@ end
 Splice the data in `buffer` to the pipe in `fdesc`.
 """
 vmsplice(fdesc::RawFD, buffer::StaticBuffer) = begin
-  ix = 1
-  while ix < buffer.nextindex
+  ptr = pointer(buffer.buf)
+  while ptr < buffer.ptr
     written = @ccall vmsplice(
       fdesc :: Cint,
-      (pointer(buffer.buf, ix), buffer.nextindex - ix) :: Ref{Tuple{Ref{UInt8}, Csize_t}},
+      (ptr, buffer.ptr - ptr) :: Ref{Tuple{Ref{UInt8}, Csize_t}},
       1 :: Csize_t,
       0 :: Cuint) :: Cssize_t
     if written < 0
       error("Couldn't write to pipe")
     end
-    ix += written
+    ptr += written
   end
 end
 
@@ -116,13 +125,6 @@ Perform a carry operation on asciidigits in the `position`th decimal place.
 @inline carry(position, asciidigits, plusone, pluscarry) = begin
   if position + 1 == length(asciidigits)
     asciidigits = concat(asciidigits, '0')
-
-    logstr = string(
-      "Number of digits is now $(length(asciidigits) - 1); ",
-      "elapsed time is $((time_ns() - LOGSTART[]) / 10^9) s",
-      "\n",
-    )
-    write(stderr, logstr)
 
     plusone <<= 8
     pluscarry = pluscarry .<< 8
@@ -191,41 +193,17 @@ const FIZZ = ShortString("Fizz\n")
 const BUZZ = ShortString("Buzz\n")
 const FIZZBUZZ = ShortString("FizzBuzz\n")
 
-"""
-  buffer = fizzbuzz(buffer::StaticBuffer, range::UnitRange)
+initialstate() = (
+  intdigits = (1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+  asciidigits = ShortString("1\n"),
+  plusone = UInt128(1),
+  pluscarry = ntuple(_ -> zero(UInt128), Val(sizeof(UInt128)))
+)
 
-Write the fizzbuzz output for line numbers in `range` to
-`buffer`. It expects that range is of the form
+fizzbuzz(buffer::StaticBuffer, state) = begin
+  (;intdigits, asciidigits, plusone, pluscarry) = state
 
-    15i + 1 : 15j
-
-for some values of `i <= j`.
-"""
-fizzbuzz(buffer::StaticBuffer, range::UnitRange) = begin
-  iterations, remainder = divrem(length(range), 15)
-  @assert remainder == 0
-  @assert rem(first(range), 15) == 1
-  @assert length(buffer) >= length(range) * sizeof(UInt128)
-
-  lo = first(range)
-
-  intdigits = digits(lo, pad=17)
-  intdigits = tuple(intdigits...)::NTuple{17, Int}
-
-  asciidigits = ShortString("$lo\n")
-  numdigits = length(asciidigits) - 1
-
-  plusone = UInt128(1) << 8(numdigits - 1)
-
-  pluscarry = ntuple(Val(sizeof(UInt128))) do d
-    if d < numdigits
-      CARRY << 8(numdigits - d - 1)
-    else
-      UInt128(0)
-    end
-  end
-
-  @GC.preserve buffer for _ in 1:iterations
+  while !almostfull(buffer)
     buffer = put(buffer, asciidigits)
 
     asciidigits, intdigits = nextline(asciidigits, intdigits, plusone)
@@ -272,42 +250,37 @@ fizzbuzz(buffer::StaticBuffer, range::UnitRange) = begin
 
     asciidigits, intdigits = nextline(asciidigits, intdigits, plusone)
   end
-  buffer
+  buffer, (;intdigits,asciidigits,plusone,pluscarry)
 end
 
-const BUFSIZE = 100 * 4096
-
 fizzbuzz(fdesc::RawFD, cutoff=typemax(Int)) = begin
-  LOGSTART[] = time_ns()
+  pipesize = @ccall fcntl(fdesc::Cint, 1031::Cint, BUFSIZE::Cint)::Cint
+  @assert pipesize == BUFSIZE
 
-  buffers = [StaticBuffer(BUFSIZE) for _ in 1:Threads.nthreads()]
+  buf1, buf2 = StaticBuffer(BUFSIZE), StaticBuffer(BUFSIZE)
 
-  nextline = 1
-  chunklen = div(BUFSIZE, sizeof(UInt128))
-  chunklen -= rem(chunklen, 15)
+  state = initialstate()
+  n = 0
 
-  tasks = [@Threads.spawn(fizzbuzz(buf, 1:0)) for buf in buffers]
+  @GC.preserve buf1 buf2 while n <= cutoff
 
-  while nextline <= cutoff
-    for t in eachindex(tasks)
-      buffer = fetch(tasks[t])
-      vmsplice(fdesc, buffer)
+    buf1, state = fizzbuzz(truncate(buf1), state)
+    vmsplice(fdesc, buf1)
+    n += length(buf1)
 
-      lo = nextline
-      hi = nextline + chunklen - 1
-      tasks[t] = @Threads.spawn fizzbuzz(truncate(buffers[t]), lo:hi)
-      nextline += chunklen
-    end
+
+    buf2, state = fizzbuzz(truncate(buf2), state)
+    vmsplice(fdesc, buf2)
+    n += length(buf2)
   end
 end
 
 """
   fizzbuzz(io::IO, cutoff=typemax(Int))
 
-Write the fizzbuzz output to `io`. This will spawn `Threads.nthreads()`
-tasks to maximize throughput through parallellism.
+Write the fizzbuzz output to `io`.
 
-The `cutoff` parameter is approximate; depending on buffering, more lines
+The `cutoff` parameter is approximate; depending on buffering, more bytes
 may be written to `io`.
 """
 fizzbuzz(io::IO, cutoff=typemax(Int)) = withpipefd(fizzbuzz, io, cutoff)
